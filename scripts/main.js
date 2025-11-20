@@ -5,6 +5,9 @@ document.getElementById('imageInput').addEventListener('change', function (e) {
     document.getElementById('fileCount').innerText = count > 0 ? `${count}枚 選択中` : "未選択";
 });
 
+/**
+ * @description フォームの入力値に基づいてPDFを生成し、ダウンロードするメインロジック
+ */
 async function generatePDF() {
     const files = document.getElementById('imageInput').files;
 
@@ -24,6 +27,17 @@ async function generatePDF() {
         const targetW = parseFloat(document.getElementById('imgWidth').value);
         const gap = parseFloat(document.getElementById('gap').value);
 
+        if (targetW <= 0 || isNaN(targetW)) {
+            alert("画像の横幅は正の数で入力してください。");
+            btn.disabled = false;
+            return;
+        }
+
+        if (gap <= 0 || isNaN(gap)) {
+            alert("余白は正の数で入力してください。");
+            btn.disabled = false;
+            return;
+        }
         const needBorder = document.getElementById('drawBorder').checked;
         const colorKey = document.getElementById('borderColor').value;
 
@@ -110,6 +124,11 @@ async function generatePDF() {
     }
 }
 
+/**
+ * @description FileオブジェクトをBase64のData URLとして読み込む非同期処理
+ * @param {File} file - 読み込むファイルオブジェクト
+ * @returns {Promise<string>} Promise (Base64形式のData URL)
+ */
 function readFileAsDataURL(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -119,6 +138,11 @@ function readFileAsDataURL(file) {
     });
 }
 
+/**
+ * @description 画像のURLから幅と高さを非同期で取得する処理
+ * @param {string} url - Base64形式の画像URL
+ * @returns {Promise<{w: number, h: number}>} 画像の幅と高さを含むPromise
+ */
 function getImageDimensions(url) {
     return new Promise((resolve, reject) => {
         const img = new Image();
@@ -128,6 +152,9 @@ function getImageDimensions(url) {
     });
 }
 
+/**
+ * @description フィードバック用のフォームを新しいウィンドウで開く
+ */
 function openFeedbackForm() {
     const feedbackUrl = "https://forms.gle/tcwM6t2qGXyEZpFcA";
     window.open(feedbackUrl, '_blank');
