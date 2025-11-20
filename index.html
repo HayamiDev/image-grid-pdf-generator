@@ -13,7 +13,10 @@
     <div class="card">
         <label>1. 画像を選択 (複数可)</label>
         <input type="file" id="imageInput" multiple accept="image/*">
-        <div id="fileCount" class="note">未選択</div>
+        <div class="note">
+            <span id="fileCount">未選択</span>
+            <span id="pageTotal" style="margin-left: 10px; font-weight:bold; color:#ff6b6b;"></span>
+        </div>
 
         <label>2. 画像の横幅 (mm)</label>
         <input type="number" id="imgWidth" value="30" min="10" max="190">
@@ -43,12 +46,19 @@
             </select>
         </div>
 
-        <button id="generateBtn" onclick="generatePDF()">PDFを作成してダウンロード</button>
+        <button id="generateBtn">PDFを作成してダウンロード</button>
         <p id="status"></p>
+
+        <h2 style="text-align:center; margin-top: 40px; color:#ff6b6b;">リアルタイムプレビュー</h2>
+        <p class="note" style="text-align: center;">※実際のPDFの1ページ目のイメージです</p>
+
+        <div id="preview-container">
+            <canvas id="previewCanvas"></canvas>
+        </div>
     </div>
 
     <div id="feedback-footer" style="text-align: center; margin-top: 50px; padding-bottom: 20px;">
-        <a href="javascript:void(0)" onclick="openFeedbackForm()" style="color: #999; text-decoration: none; font-size: 0.85em; transition: color 0.3s;">
+        <a href="javascript:void(0)" id="feedbackLink" style="color: #999; text-decoration: none; font-size: 0.85em; transition: color 0.3s;">
             フィードバック・要望を送る
         </a>
     </div>
