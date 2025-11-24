@@ -8,6 +8,7 @@ from anthropic import Anthropic
 from dataclasses import dataclass
 import json
 import re
+import tiktoken
 
 # --- CONFIG設定クラスの定義 ---
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class ReviewConfig:
     summarizer_model: str
     small_diff_threshold: int
     flash_only_max_tokens: int
+    claude_max_tokens: int
 
 # --- CONFIGインスタンスの作成（読み込み） ---
 CONFIG = ReviewConfig(
@@ -27,7 +29,8 @@ CONFIG = ReviewConfig(
     summarizer_model=os.getenv("SUMMARIZER_MODEL", "gemini-2.5-pro"),
 
     small_diff_threshold=int(os.getenv("SMALL_DIFF_THRESHOLD", 30000)),
-    flash_only_max_tokens=int(os.getenv("FLASH_ONLY_MAX_TOKENS", 300000))
+    flash_only_max_tokens=int(os.getenv("FLASH_ONLY_MAX_TOKENS", 100000)),
+    claude_max_tokens=int(os.getenv("CLAUDE_MAX_TOKEN", 2048)),
 )
 
 # AIの役割と指示を定義するシステムプロンプト
@@ -50,19 +53,26 @@ SYSTEM_PROMPT = """
 # 変更差分(Diff)の取得
 def get_diff(pr):
     files = pr.get_files()
-    files_to_exclude = ['.env', '.env.local', 'secrets.yaml']
+    excluded_filenames = {'.env', '.env.local', 'secrets.yaml'}
+    excluded_extensions = {'.lock', '.png', '.jpg', '.svg'}
     raw_diff_text = ""
+
     for file in files:
-        if file.filename.endswith(tuple(files_to_exclude)): continue
-        if file.filename.endswith(('.lock', '.png', '.jpg', '.svg')): continue
+        filename = os.path.basename(file.filename)
+        if filename in excluded_filenames:
+            continue
+        if any(file.filename.endswith(ext) for ext in excluded_extensions):
+            continue
         if not file.patch:
-             continue
+            continue
         raw_diff_text += f"File: {file.filename}\nDiff:\n{file.patch}\n\n"
     return raw_diff_text
 
-def check_diff_size(pr, diff_text):
-    # 簡単なトークン数の概算 (文字数/3で近似)
-    token_count = len(diff_text) // 3
+def check_diff_size(diff_text):
+    # トークン数計算
+    encoding = tiktoken.encoding_for_model(CONFIG.gpt_model)
+    tokens = encoding.encode(diff_text)
+    token_count = len(tokens)
 
     if token_count > CONFIG.flash_only_max_tokens:
         return False, token_count
@@ -121,7 +131,7 @@ async def ask_claude(diff_text):
         client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         message = client.messages.create(
             model=CONFIG.claude_model,
-            max_tokens=2048,
+            max_tokens=CONFIG.claude_max_tokens,
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": f"以下のコード差分をレビューしてください:\n---\n{diff_text}\n---"}
@@ -174,17 +184,14 @@ def create_final_comment(summary_report: str, individual_results: list[str]) -> 
     final_comment += "\n\n" + collapsible_section
     return final_comment
 
-async def select_and_run_models(pr, diff_text: str, token_count: int) -> list[str]:
-    """
-    DIFFサイズに基づき、最適なAIモデルを選択し、非同期でレビューを実行する。
-    """
+async def select_and_run_models(redacted_diff: str, token_count: int) -> list[str]:
     if token_count <= CONFIG.small_diff_threshold:
         # 高性能レビュー（3モデル使用）
         print("INFO: 3つのAIモデルによる並列レビューを実行中...")
         results_raw = await asyncio.gather(
-            ask_gemini(diff_text),
-            ask_openai(diff_text),
-            ask_claude(diff_text),
+            ask_gemini(redacted_diff),
+            ask_openai(redacted_diff),
+            ask_claude(redacted_diff),
             return_exceptions=True
         )
 
@@ -194,7 +201,7 @@ async def select_and_run_models(pr, diff_text: str, token_count: int) -> list[st
         message = f"⚠️ **DIFFサイズ ({token_count} トークン) のため、Geminiのみでコスト優先レビューを実施しました。**"
 
         results_raw = await asyncio.gather(
-            ask_gemini(diff_text),
+            ask_gemini(redacted_diff),
             return_exceptions=True
         )
         results_raw.append(message)
@@ -202,6 +209,7 @@ async def select_and_run_models(pr, diff_text: str, token_count: int) -> list[st
     else:
         return []
 
+    # 例外オブジェクトをフィルタリングし、成功したレビュー結果のみを抽出
     results = [r for r in results_raw if not isinstance(r, Exception)]
 
     # 全てのAIが失敗した場合の処理
@@ -217,53 +225,28 @@ def validate_env_vars():
     if missing:
         raise EnvironmentError(f"致命的エラー: 以下の必須環境変数が未設定です: {', '.join(missing)}")
 
-# メイン処理
-async def main():
-    validate_env_vars()
+validate_env_vars()
 
-    # GitHubの設定
-    g = Github(os.getenv("GITHUB_TOKEN"))
-    repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
-    event_path = os.getenv("GITHUB_EVENT_PATH")
-    with open(event_path) as f:
-        event = json.load(f)
-
-    if "pull_request" not in event:
-        print("INFO: PRイベントではないためAIレビューをスキップします。")
-        exit()
-
-    pr_number = event["pull_request"]["number"]
-    pr = repo.get_pull(pr_number)
-
+async def process_review(pr):
     raw_diff_text = get_diff(pr)
-
     if not raw_diff_text:
         print("変更差分が検出されないため、処理を終了します。")
-        return
+        return None
 
     clean_diff = redact_secrets(raw_diff_text)
     is_ok, token_count = check_diff_size(pr, clean_diff)
 
-    # Diffが多すぎる場合終了
     if not is_ok:
-        pr.create_issue_comment(
-            f"🚨 **警告: DIFFサイズが大きすぎます (約 {token_count} トークン)**\n"
-            "AIレビューをスキップしました。レビュー精度とコスト抑制のため、手動でのレビューをお願いします。"
-        )
-        return
+        return create_size_warning_message(token_count)
 
     results = await select_and_run_models(pr, clean_diff, token_count)
-
-    # レビューが実行できなかった場合終了
     if not results:
-        pr.create_issue_comment("🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。APIキーまたはサービス状態を確認してください。")
-        return
+        return "🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。"
 
-    print("INFO: レビュー結果の統合処理を実行中...")
     summary_report = await summarize_reviews(results)
+    return create_final_comment(summary_report, results)
 
-    final_comment = create_final_comment(summary_report, results)
-
+async def delete_old_review_comments(pr):
     # 過去のボットのコメントを削除するロジック
     print("INFO: 既存のレビューコメントを削除中...")
     comments = pr.get_issue_comments()
@@ -276,9 +259,28 @@ async def main():
             except Exception as e:
                 print(f"WARN: コメント削除に失敗しました (無視): {e}")
 
-    # コメント投稿
-    pr.create_issue_comment(final_comment)
-    print("SUCCESS: レビュー処理が完了しました。")
+# メイン処理
+async def main():
+
+    # GitHubの設定
+    g = Github(os.getenv("GITHUB_TOKEN"))
+    repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    with open(event_path) as f:
+        event = json.load(f)
+
+    if "pull_request" not in event:
+        print("INFO: PRイベントではないためAIレビューをスキップします。")
+        return
+
+    pr = repo.get_pull(event["pull_request"]["number"])
+    final_comment = await process_review(pr)
+
+    if final_comment:
+        delete_old_review_comments(pr)
+        pr.create_issue_comment(final_comment)
+        print("SUCCESS: レビュー処理が完了しました。")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
