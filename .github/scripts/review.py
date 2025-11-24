@@ -5,6 +5,9 @@ import google.generativeai as genai
 from openai import OpenAI
 from anthropic import Anthropic
 from dataclasses import dataclass
+import json
+import re
+from google.generativeai.types import APIError
 
 # --- CONFIG設定クラスの定義 ---
 @dataclass(frozen=True)
@@ -44,27 +47,47 @@ SYSTEM_PROMPT = """
 * **可読性**：命名規則の違反、マジックナンバーの使用、コメント不足。
 """
 
-# GitHubの設定
-g = Github(os.getenv("GITHUB_TOKEN"))
-repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
-pr_number = int(os.getenv("GITHUB_REF").split("/")[-2])
-pr = repo.get_pull(pr_number)
-
 # 変更差分(Diff)の取得
-def get_diff():
-    return pr.get_files()
+def get_diff(pr):
+    files = pr.get_files()
+    files_to_exclude = ['.env', '.env.local', 'secrets.yaml']
+    raw_diff_text = ""
+    for file in files:
+        if file.filename.endswith(tuple(files_to_exclude)): continue
+        if file.filename.endswith(('.lock', '.png', '.jpg', '.svg')): continue
+        if not file.patch:
+             continue
+        raw_diff_text += f"File: {file.filename}\nDiff:\n{file.patch}\n\n"
+    return raw_diff_text
 
-def check_diff_size(diff_text):
+def check_diff_size(pr, diff_text):
     # 簡単なトークン数の概算 (文字数/3で近似)
     token_count = len(diff_text) // 3
 
     if token_count > CONFIG.flash_only_max_tokens:
-        pr.create_issue_comment(
-            f"🚨 **警告: DIFFサイズが大きすぎます (約 {token_count} トークン)**\n"
-            "AIレビューをスキップしました。レビュー精度とコスト抑制のため、手動でのレビューをお願いします。"
-        )
         return False, token_count
     return True, token_count
+
+def redact_secrets(diff_text: str) -> str:
+    secret_patterns = [
+        # --- 共通＆主要なクラウド/サービス ---
+        r'(AKIA[0-9A-Z]{16,})',          # AWS Access Key ID
+        r'(ghp_[0-9a-zA-Z]{36,})',       # GitHub Personal Access Token (ghp_)
+        r'(ghs_[0-9a-zA-Z]{36,})',       # GitHub Scoped Token (ghs_)
+        r'(xoxb-[0-9a-zA-Z-]+)',         # Slack Bot Token
+        r'(sk-[0-9a-zA-Z]{32,})',        # OpenAI Key
+        r'(?:rk|sk)_(?:live|test)_[0-9a-zA-Z]{24,}', # Stripe API Key
+        r'(Bearer\s+[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)', # JWT / Bearer Token
+        r'(pk-[0-9a-zA-Z]{24,})',        # OpenAI/Anthropic Key
+        r'(AIza[0-9A-Za-z-_]{35})',      # Google API Key
+    ]
+    # 置換後の文字列
+    REDACTED_TEXT = "[REDACTED_SECRET]"
+
+    for pattern in secret_patterns:
+        diff_text = re.sub(pattern, REDACTED_TEXT, diff_text)
+
+    return diff_text
 
 # 各AIへのリクエスト関数
 async def ask_gemini(diff_text):
@@ -76,10 +99,12 @@ async def ask_gemini(diff_text):
             )
         response = model.generate_content(f"以下のコード差分をレビューしてください:\n---\n{diff_text}\n---")
         return f"## ♊ Gemini\n{response.text}"
+    except APIError as e:
+        raise e
     except Exception as e:
         return f"## ♊ Gemini (Error)\nエラーが発生しました: {e}"
 
-async def ask_gpt4o(diff_text):
+async def ask_openai(diff_text):
     try:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         response = client.chat.completions.create(
@@ -90,6 +115,8 @@ async def ask_gpt4o(diff_text):
             ]
         )
         return f"## 🤖 ChatGPT\n{response.choices[0].message.content}"
+    except OpenAI.APIError as e:
+        raise e
     except Exception as e:
         return f"## 🤖 ChatGPT (Error)\nエラーが発生しました: {e}"
 
@@ -105,6 +132,8 @@ async def ask_claude(diff_text):
             ]
         )
         return f"## 🧠 Claude\n{message.content[0].text}"
+    except Anthropic.APIError as e:
+        raise e
     except Exception as e:
         return f"## 🧠 Claude (Error)\nエラーが発生しました: {e}"
 
@@ -151,27 +180,30 @@ def create_final_comment(summary_report: str, individual_results: list[str]) -> 
     final_comment += "\n\n" + collapsible_section
     return final_comment
 
-async def select_and_run_models(diff_text: str, token_count: int) -> list[str]:
+async def select_and_run_models(pr, diff_text: str, token_count: int) -> list[str]:
     """
     DIFFサイズに基づき、最適なAIモデルを選択し、非同期でレビューを実行する。
     """
     if token_count <= CONFIG.small_diff_threshold:
         # 高性能レビュー（3モデル使用）
         print("INFO: 3つのAIモデルによる並列レビューを実行中...")
-        return await asyncio.gather(
+        results_raw = await asyncio.gather(
             ask_gemini(diff_text),
-            ask_gpt4o(diff_text),
+            ask_openai(diff_text),
             ask_claude(diff_text),
             return_exceptions=True
         )
 
     elif token_count <= CONFIG.flash_only_max_tokens:
         # コスト優先レビュー（Gemini Flashのみ使用）
-        print(f"INFO: DIFFサイズが大きいため ({token_count} tokens)、Gemini Flashのみでレビューを実行します。")
-        pr.create_issue_comment(
-            f"⚠️ **DIFFサイズ ({token_count} トークン) のため、Geminiのみでコスト優先レビューを実施します。**"
+        print(f"INFO: DIFFサイズが大きいため ({token_count} tokens)、Geminiのみでレビューを実行します。")
+        message = f"⚠️ **DIFFサイズ ({token_count} トークン) のため、Geminiのみでコスト優先レビューを実施しました。**"
+
+        results_raw = await asyncio.gather(
+            ask_gemini(diff_text),
+            return_exceptions=True
         )
-        results_raw = [await ask_gemini(diff_text)]
+        results_raw.append(message)
 
     else:
         return []
@@ -180,33 +212,57 @@ async def select_and_run_models(diff_text: str, token_count: int) -> list[str]:
 
     # 全てのAIが失敗した場合の処理
     if not results:
-        pr.create_issue_comment("🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。APIキーまたはサービス状態を確認してください。")
         return []
 
     return results
 
+def validate_env_vars():
+    required = ["GITHUB_TOKEN", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+    missing = [k for k in required if not os.getenv(k)]
+
+    if missing:
+        raise EnvironmentError(f"致命的エラー: 以下の必須環境変数が未設定です: {', '.join(missing)}")
 
 # メイン処理
 async def main():
-    files = get_diff()
-    diff_text = ""
-    for file in files:
-        if file.filename.endswith(('.lock', '.png', '.jpg', '.svg')): continue
-        if not file.patch:
-             continue
-        diff_text += f"File: {file.filename}\nDiff:\n{file.patch}\n\n"
+    validate_env_vars()
 
-    if not diff_text:
+    # GitHubの設定
+    g = Github(os.getenv("GITHUB_TOKEN"))
+    repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    with open(event_path) as f:
+        event = json.load(f)
+
+    if "pull_request" not in event:
+        print("INFO: PRイベントではないためAIレビューをスキップします。")
+        exit()
+
+    pr_number = event["pull_request"]["number"]
+    pr = repo.get_pull(pr_number)
+
+    raw_diff_text = get_diff(pr)
+
+    if not raw_diff_text:
         print("変更差分が検出されないため、処理を終了します。")
         return
 
-    is_ok, token_count = check_diff_size(diff_text)
-    if not is_ok: return
+    clean_diff = redact_secrets(raw_diff_text)
+    is_ok, token_count = check_diff_size(pr, clean_diff)
 
-    results = await select_and_run_models(diff_text, token_count)
+    # Diffが多すぎる場合終了
+    if not is_ok:
+        pr.create_issue_comment(
+            f"🚨 **警告: DIFFサイズが大きすぎます (約 {token_count} トークン)**\n"
+            "AIレビューをスキップしました。レビュー精度とコスト抑制のため、手動でのレビューをお願いします。"
+        )
+        return
+
+    results = await select_and_run_models(pr, clean_diff, token_count)
 
     # レビューが実行できなかった場合終了
     if not results:
+        pr.create_issue_comment("🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。APIキーまたはサービス状態を確認してください。")
         return
 
     print("INFO: レビュー結果の統合処理を実行中...")
