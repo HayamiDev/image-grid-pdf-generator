@@ -4,6 +4,28 @@ from github import Github
 import google.generativeai as genai
 from openai import OpenAI
 from anthropic import Anthropic
+from dataclasses import dataclass
+
+# --- CONFIG設定クラスの定義 ---
+@dataclass(frozen=True)
+class ReviewConfig:
+    gemini_model: str
+    gpt_model: str
+    claude_model: str
+    summarizer_model: str
+    small_diff_threshold: int
+    flash_only_max_tokens: int
+
+# --- CONFIGインスタンスの作成（読み込み） ---
+CONFIG = ReviewConfig(
+    gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    gpt_model=os.getenv("GPT_MODEL", "gpt-4o"),
+    claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5"),
+    summarizer_model=os.getenv("SUMMARIZER_MODEL", "gemini-2.5-pro"),
+
+    small_diff_threshold=int(os.getenv("SMALL_DIFF_THRESHOLD", 30000)),
+    flash_only_max_tokens=int(os.getenv("FLASH_ONLY_MAX_TOKENS", 300000))
+)
 
 # AIの役割と指示を定義するシステムプロンプト
 SYSTEM_PROMPT = """
@@ -28,10 +50,6 @@ repo = g.get_repo(os.getenv("GITHUB_REPOSITORY"))
 pr_number = int(os.getenv("GITHUB_REF").split("/")[-2])
 pr = repo.get_pull(pr_number)
 
-# Diffの最大のトークン数
-SMALL_DIFF_THRESHOLD    = 30000
-FLASH_ONLY_MAX_TOKENS   = 300000
-
 # 変更差分(Diff)の取得
 def get_diff():
     return pr.get_files()
@@ -40,7 +58,7 @@ def check_diff_size(diff_text):
     # 簡単なトークン数の概算 (文字数/3で近似)
     token_count = len(diff_text) // 3
 
-    if token_count > FLASH_ONLY_MAX_TOKENS:
+    if token_count > CONFIG.flash_only_max_tokens:
         pr.create_issue_comment(
             f"🚨 **警告: DIFFサイズが大きすぎます (約 {token_count} トークン)**\n"
             "AIレビューをスキップしました。レビュー精度とコスト抑制のため、手動でのレビューをお願いします。"
@@ -53,7 +71,7 @@ async def ask_gemini(diff_text):
     try:
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         model = genai.GenerativeModel(
-                os.getenv("GEMINI_MODEL", "gemini-3.0-flash"),
+                CONFIG.gemini_model,
                 system_instruction=SYSTEM_PROMPT
             )
         response = model.generate_content(f"以下のコード差分をレビューしてください:\n---\n{diff_text}\n---")
@@ -65,7 +83,7 @@ async def ask_gpt4o(diff_text):
     try:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         response = client.chat.completions.create(
-            model=os.getenv("GPT_MODEL", "gpt-4o"),
+            model=CONFIG.gpt_model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"以下のコード差分をレビューしてください:\n---\n{diff_text}\n---"}
@@ -79,7 +97,7 @@ async def ask_claude(diff_text):
     try:
         client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         message = client.messages.create(
-            model=os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20240620"),
+            model=CONFIG.claude_model,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[
@@ -93,7 +111,7 @@ async def ask_claude(diff_text):
 async def summarize_reviews(all_results):
     try:
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model_name = os.getenv("SUMMARIZER_MODEL", "gemini-1.5-pro")
+        model_name = CONFIG.summarizer_model
 
         summarizer_model = genai.GenerativeModel(
             model_name,
@@ -133,6 +151,41 @@ def create_final_comment(summary_report: str, individual_results: list[str]) -> 
     final_comment += "\n\n" + collapsible_section
     return final_comment
 
+async def select_and_run_models(diff_text: str, token_count: int) -> list[str]:
+    """
+    DIFFサイズに基づき、最適なAIモデルを選択し、非同期でレビューを実行する。
+    """
+    if token_count <= CONFIG.small_diff_threshold:
+        # 高性能レビュー（3モデル使用）
+        print("INFO: 3つのAIモデルによる並列レビューを実行中...")
+        return await asyncio.gather(
+            ask_gemini(diff_text),
+            ask_gpt4o(diff_text),
+            ask_claude(diff_text),
+            return_exceptions=True
+        )
+
+    elif token_count <= CONFIG.flash_only_max_tokens:
+        # コスト優先レビュー（Gemini Flashのみ使用）
+        print(f"INFO: DIFFサイズが大きいため ({token_count} tokens)、Gemini Flashのみでレビューを実行します。")
+        pr.create_issue_comment(
+            f"⚠️ **DIFFサイズ ({token_count} トークン) のため、Geminiのみでコスト優先レビューを実施します。**"
+        )
+        results_raw = [await ask_gemini(diff_text)]
+
+    else:
+        return []
+
+    results = [r for r in results_raw if not isinstance(r, Exception)]
+
+    # 全てのAIが失敗した場合の処理
+    if not results:
+        pr.create_issue_comment("🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。APIキーまたはサービス状態を確認してください。")
+        return []
+
+    return results
+
+
 # メイン処理
 async def main():
     files = get_diff()
@@ -150,27 +203,14 @@ async def main():
     is_ok, token_count = check_diff_size(diff_text)
     if not is_ok: return
 
-    if token_count <= SMALL_DIFF_THRESHOLD:
-        print("INFO: 3つのAIモデルによる並列レビューを実行中...")
-        results = await asyncio.gather(
-            ask_gemini(diff_text),
-            ask_gpt4o(diff_text),
-            ask_claude(diff_text)
-        )
-    elif token_count <= FLASH_ONLY_MAX_TOKENS:
-        print(f"INFO: DIFFサイズが大きいため ({token_count} tokens)、Gemini Flashのみでレビューを実行します。")
-        pr.create_issue_comment(
-            f"⚠️ **DIFFサイズ ({token_count} トークン) のため、Geminiのみでコスト優先レビューを実施します。**"
-        )
-        results = [await ask_gemini(diff_text)]
-    else:
+    results = await select_and_run_models(diff_text, token_count)
+
+    # レビューが実行できなかった場合終了
+    if not results:
         return
 
-    if len(results) > 0:
-        print("INFO: レビュー結果の統合処理を実行中...")
-        summary_report = await summarize_reviews(results)
-    else:
-        return
+    print("INFO: レビュー結果の統合処理を実行中...")
+    summary_report = await summarize_reviews(results)
 
     final_comment = create_final_comment(summary_report, results)
 
