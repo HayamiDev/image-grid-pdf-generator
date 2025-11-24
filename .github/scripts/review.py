@@ -239,7 +239,7 @@ async def process_review(pr):
     if not is_ok:
         return create_size_warning_message(token_count)
 
-    results = await select_and_run_models(pr, clean_diff, token_count)
+    results = await select_and_run_models(clean_diff, token_count)
     if not results:
         return "🚨 致命的なエラー: 全てのAIサービスへの接続が失敗しました。"
 
