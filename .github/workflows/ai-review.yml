@@ -24,14 +24,15 @@ jobs:
       - name: Run Multi-AI Review Script
         env:
           # モデル名
-          GEMINI_MODEL: gemini-2.5-flash-lite
+          GEMINI_MODEL: gemini-2.5-flash
           GPT_MODEL: gpt-4o
           CLAUDE_MODEL: claude-sonnet-4-5
           SUMMARIZER_MODEL: gemini-2.5-pro
 
           # 制限
           SMALL_DIFF_THRESHOLD: 30000
-          FLASH_ONLY_MAX_TOKENS: 300000
+          FLASH_ONLY_MAX_TOKENS: 100000
+          CLAUDE_MAX_TOKEN: 2048
 
           # APIキー
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
