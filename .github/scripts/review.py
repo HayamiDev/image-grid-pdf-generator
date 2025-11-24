@@ -1,3 +1,4 @@
+import sys
 import os
 import asyncio
 from github import Github
@@ -7,7 +8,7 @@ from anthropic import Anthropic
 from dataclasses import dataclass
 import json
 import re
-from google.generativeai.types import APIError
+from google.generativeai.errors import APIError
 
 # --- CONFIG設定クラスの定義 ---
 @dataclass(frozen=True)
