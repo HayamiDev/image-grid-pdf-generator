@@ -32,7 +32,7 @@ jobs:
           # 制限
           SMALL_DIFF_THRESHOLD: 30000
           FLASH_ONLY_MAX_TOKENS: 100000
-          CLAUDE_MAX_TOKEN: 2048
+          CLAUDE_MAX_TOKENS: 2048
 
           # APIキー
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

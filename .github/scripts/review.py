@@ -1,4 +1,3 @@
-import sys
 import os
 import asyncio
 from github import Github
@@ -30,7 +29,7 @@ CONFIG = ReviewConfig(
 
     small_diff_threshold=int(os.getenv("SMALL_DIFF_THRESHOLD", 30000)),
     flash_only_max_tokens=int(os.getenv("FLASH_ONLY_MAX_TOKENS", 100000)),
-    claude_max_tokens=int(os.getenv("CLAUDE_MAX_TOKEN", 2048)),
+    claude_max_tokens=int(os.getenv("CLAUDE_MAX_TOKENS", 2048)),
 )
 
 # AIの役割と指示を定義するシステムプロンプト
@@ -90,6 +89,10 @@ def redact_secrets(diff_text: str) -> str:
         r'(Bearer\s+[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)', # JWT / Bearer Token
         r'(pk-[0-9a-zA-Z]{24,})',        # OpenAI/Anthropic Key
         r'(AIza[0-9A-Za-z-_]{35})',      # Google API Key
+        r'-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----',  # 秘密鍵ブロック
+        r'(?i)password\s*[=:]\s*["\']?([^\s"\']{8,})["\']?',  # password=xxxx 形式
+        r'(?i)api[-_]?key\s*[=:]\s*["\']?([a-zA-Z0-9_\-]{20,})["\']?',  # api_key=xxxx 形式
+        r'([a-zA-Z0-9+/]{40,}={0,2})',  # Base64 (40文字以上)
     ]
     # 置換後の文字列
     REDACTED_TEXT = "[REDACTED_SECRET]"
@@ -204,16 +207,22 @@ async def select_and_run_models(redacted_diff: str, token_count: int) -> list[st
             ask_gemini(redacted_diff),
             return_exceptions=True
         )
-        results_raw.append(message)
+        results_raw = list(results_raw) + [message]
 
     else:
         return []
 
-    # 例外オブジェクトをフィルタリングし、成功したレビュー結果のみを抽出
-    results = [r for r in results_raw if not isinstance(r, Exception)]
+    # 例外を検出してログ出力
+    results = []
+    for idx, r in enumerate(results_raw):
+        if isinstance(r, Exception):
+            print(f"ERROR: AI Model {idx+1} failed with exception: {r}")
+        else:
+            results.append(r)
 
     # 全てのAIが失敗した場合の処理
     if not results:
+        print("ERROR: 全てのAIサービスが失敗しました。")
         return []
 
     return results
@@ -226,6 +235,20 @@ def validate_env_vars():
         raise EnvironmentError(f"致命的エラー: 以下の必須環境変数が未設定です: {', '.join(missing)}")
 
 validate_env_vars()
+
+def create_size_warning_message(token_count: int) -> str:
+    return f"""
+🚨 **Diff サイズ超過エラー**
+
+このPRの変更差分が大きすぎるため、AIレビューを実行できません。
+
+- **トークン数**: {token_count:,} tokens
+- **最大許容**: {CONFIG.flash_only_max_tokens:,} tokens
+
+**推奨対応**：
+1. PRを複数の小さなPRに分割してください
+2. 自動生成ファイル（lock ファイルなど）を除外してください
+"""
 
 async def process_review(pr):
     raw_diff_text = get_diff(pr)
