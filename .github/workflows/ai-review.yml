@@ -19,7 +19,7 @@ jobs:
 
       - name: Install AI dependencies
         # APIを叩くためのライブラリを一括インストール
-        run: pip install PyGithub requests google-generativeai openai anthropic
+        run: pip install PyGithub requests google-generativeai openai anthropic tiktoken
 
       - name: Run Multi-AI Review Script
         env:
