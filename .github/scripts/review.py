@@ -234,7 +234,7 @@ async def process_review(pr):
         return None
 
     clean_diff = redact_secrets(raw_diff_text)
-    is_ok, token_count = check_diff_size(pr, clean_diff)
+    is_ok, token_count = check_diff_size(clean_diff)
 
     if not is_ok:
         return create_size_warning_message(token_count)
