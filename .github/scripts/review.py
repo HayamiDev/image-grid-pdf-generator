@@ -8,7 +8,6 @@ from anthropic import Anthropic
 from dataclasses import dataclass
 import json
 import re
-from google.generativeai.errors import APIError
 
 # --- CONFIG設定クラスの定義 ---
 @dataclass(frozen=True)
@@ -100,8 +99,6 @@ async def ask_gemini(diff_text):
             )
         response = model.generate_content(f"以下のコード差分をレビューしてください:\n---\n{diff_text}\n---")
         return f"## ♊ Gemini\n{response.text}"
-    except APIError as e:
-        raise e
     except Exception as e:
         return f"## ♊ Gemini (Error)\nエラーが発生しました: {e}"
 
@@ -116,8 +113,6 @@ async def ask_openai(diff_text):
             ]
         )
         return f"## 🤖 ChatGPT\n{response.choices[0].message.content}"
-    except OpenAI.APIError as e:
-        raise e
     except Exception as e:
         return f"## 🤖 ChatGPT (Error)\nエラーが発生しました: {e}"
 
@@ -133,8 +128,6 @@ async def ask_claude(diff_text):
             ]
         )
         return f"## 🧠 Claude\n{message.content[0].text}"
-    except Anthropic.APIError as e:
-        raise e
     except Exception as e:
         return f"## 🧠 Claude (Error)\nエラーが発生しました: {e}"
 
